@@ -30,6 +30,7 @@ unsafe impl<T: ?Sized + Send> Send for Spinlock<T> {}
 ///
 /// When the guard falls out of scope it will release the lock.
 struct SpinlockGuard<'a, T: ?Sized + 'a> {
+    enable_interrupts: bool,
     dequeue: &'a AtomicUsize,
     data: &'a mut T,
 }
@@ -43,18 +44,25 @@ impl<T> Spinlock<T> {
         }
     }
 
+    /// SAFETY: must be called without interrupts
     #[inline]
-    fn obtain_lock(&self) {
+    unsafe fn obtain_lock(&self) {
         let ticket = self.queue.fetch_add(1, Ordering::SeqCst) + 1;
         while self.dequeue.load(Ordering::SeqCst) != ticket {
             hint::spin_loop();
         }
     }
 
+    /// SAFETY: Task may not yield until the SpinlockGuard has been dropped
     #[inline]
     pub unsafe fn lock(&self) -> SpinlockGuard<'_, T> {
+        let was_enabled = abi::irq_disable();
         self.obtain_lock();
-        SpinlockGuard { dequeue: &self.dequeue, data: &mut *self.data.get() }
+        SpinlockGuard { 
+            enable_interrupts: was_enabled,
+            dequeue: &self.dequeue, 
+            data: &mut *self.data.get()
+        }
     }
 }
 
@@ -81,6 +89,11 @@ impl<'a, T: ?Sized> Drop for SpinlockGuard<'a, T> {
     /// The dropping of the SpinlockGuard will release the lock it was created from.
     fn drop(&mut self) {
         self.dequeue.fetch_add(1, Ordering::SeqCst);
+        if self.enable_interrupts {
+            unsafe {
+                abi::irq_enable();
+            }
+        }
     }
 }
 
